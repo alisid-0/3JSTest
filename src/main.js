@@ -34,7 +34,13 @@ class Game {
             rightArm: this.rightArm
         });
         
+        console.log('Character group matrix:', this.character.matrix.elements);
+        this.character.updateMatrixWorld(true); // Force matrix update
+        console.log('Character world matrix:', this.character.matrixWorld.elements);
+        
         this.scene.add(this.character);
+        // Make character face away from camera by default
+        this.character.rotation.y = Math.PI;
 
         // Beach environment
         this.createBeachEnvironment();
@@ -54,8 +60,9 @@ class Game {
 
         // Physics
         this.velocity = new THREE.Vector3();
-        this.gravity = -0.005;
-        this.jumpForce = 0.35;
+        this.gravity = -0.0015;  // Reduced from -0.005 for longer hang time
+        this.jumpForce = 0.12;  // Adjusted first jump force
+        this.doubleJumpForce = 0.10;  // Adjusted second jump force
         this.dashForce = 1.2;
         this.slideForce = 0.8;
         this.isGrounded = true;
@@ -68,10 +75,16 @@ class Game {
         this.canDash = true;
         this.dashCooldown = 0;
         this.isWallRunning = false;
+        this.canJump = true;
+        this.jumpCooldown = 0;
+        this.hasDoubleJump = true;  // Track if double jump is available
+        this.isRolling = false;     // Track if doing aerial roll
+        this.rollTime = 0;          // Track roll animation progress
+        this.rollDuration = 0.5;    // Roll animation duration in seconds
 
         // Movement constants
-        this.maxWalkSpeed = 0.1;
-        this.maxRunSpeed = 0.4;
+        this.maxWalkSpeed = 0.03;      // Very slow walk
+        this.maxRunSpeed = 0.06;       // Very slow run
         this.acceleration = 0.01;
         this.deceleration = 0.95;
         this.airControl = 0.4;
@@ -101,13 +114,24 @@ class Game {
         this.clock = new THREE.Clock();
         this.walkingSpeed = 0;
 
+        // Movement states and properties
+        this.moveSpeed = 0.15;
+        this.sprintSpeed = 0.25;
+        this.slideSpeed = 0.35;
+        this.momentum = new THREE.Vector3();
+        this.slideTime = 0;
+        this.maxSlideTime = 0.8; // Slightly shorter slide
+        this.maxSlideCooldown = 0.3; // Shorter cooldown
+        this.characterState = 'idle'; // Track animation state
+
         // Setup basic movement controls
         this.keys = {
             forward: false,
             backward: false,
             left: false,
             right: false,
-            shift: false
+            shift: false,
+            ctrl: false  // slide key
         };
 
         // Debug log before setting up controls
@@ -125,9 +149,36 @@ class Game {
                 case 'KeyS': this.keys.backward = true; break;
                 case 'KeyA': this.keys.left = true; break;
                 case 'KeyD': this.keys.right = true; break;
+                case 'KeyE': // Add dash on E key press
+                    if (this.canDash) {
+                        this.performDash();
+                    }
+                    break;
+                case 'Space':
+                    if (this.isGrounded && this.canJump) {
+                        // First jump
+                        this.velocity.y = this.jumpForce;
+                        this.isGrounded = false;
+                        this.canJump = false;
+                        this.jumpCooldown = 0.2;
+                        this.hasDoubleJump = true;  // Reset double jump availability
+                    } else if (!this.isGrounded && this.hasDoubleJump && !this.isRolling) {
+                        // Double jump with roll
+                        this.velocity.y = this.doubleJumpForce;
+                        this.hasDoubleJump = false;
+                        this.isRolling = true;
+                        this.rollTime = 0;
+                    }
+                    break;
                 case 'ShiftLeft': 
                 case 'ShiftRight': 
                     this.keys.shift = true; 
+                    break;
+                case 'ControlLeft':
+                    if (this.canSlide && !this.isSliding && this.keys.shift) {
+                        this.startSlide();
+                    }
+                    this.keys.ctrl = true;
                     break;
             }
         });
@@ -141,6 +192,12 @@ class Game {
                 case 'ShiftLeft': 
                 case 'ShiftRight': 
                     this.keys.shift = false; 
+                    break;
+                case 'ControlLeft':
+                    this.keys.ctrl = false;
+                    if (this.isSliding) {
+                        this.cancelSlide();
+                    }
                     break;
             }
         });
@@ -161,149 +218,207 @@ class Game {
     }
 
     createCharacter() {
-        console.log('Starting character creation');
         const character = new THREE.Group();
+        
+        // Define proportions based on total height of 2 units
+        const proportions = {
+            totalHeight: 2.0,
+            legHeight: 1.0,             // Half of total height
+            torsoHeight: 0.75,          // 3/8 of total height
+            headRadius: 0.15,           // Head size
+            shoulderWidth: 0.5,         // Shoulder width
+            hipWidth: 0.33,             // Hip width
+            thighLength: 0.55,          // Upper leg length
+            shinLength: 0.45,           // Lower leg length
+            kneeRadius: 0.08            // Size of knee joint
+        };
 
-        // Materials
-        const skinMaterial = new THREE.MeshPhongMaterial({ color: 0xFFD1BA });
-        const clothMaterial = new THREE.MeshPhongMaterial({ color: 0x4A90E2 });
-        const shoeMaterial = new THREE.MeshPhongMaterial({ color: 0x4A4A4A });
-        const hairMaterial = new THREE.MeshPhongMaterial({ color: 0x3D2314 });
-
-        // Create limbs
-        this.leftLeg = new THREE.Group();
-        this.rightLeg = new THREE.Group();
-        this.leftArm = new THREE.Group();
-        this.rightArm = new THREE.Group();
-
-        console.log('Created limb groups:', {
-            leftLeg: this.leftLeg,
-            rightLeg: this.rightLeg,
-            leftArm: this.leftArm,
-            rightArm: this.rightArm
-        });
-
-        // Head and body parts first
-        const head = new THREE.Mesh(
-            new THREE.SphereGeometry(0.25, 16, 16),
-            skinMaterial
+        // Create torso group
+        const torsoGroup = new THREE.Group();
+        
+        // Upper torso (chest)
+        const upperTorso = new THREE.Mesh(
+            new THREE.BoxGeometry(
+                proportions.shoulderWidth,
+                proportions.torsoHeight * 0.55,
+                proportions.depth || 0.25
+            ),
+            new THREE.MeshStandardMaterial({ color: 0x2c3e50 })
         );
-        head.position.y = 1.6;
-        character.add(head);
+        upperTorso.position.y = proportions.torsoHeight * 0.225;
+        upperTorso.castShadow = true;  // Enable shadow casting
+        torsoGroup.add(upperTorso);
 
-        const hair = new THREE.Mesh(
-            new THREE.SphereGeometry(0.27, 16, 16, 0, Math.PI * 2, 0, Math.PI / 2),
-            hairMaterial
+        // Create weapon socket on the back
+        const backSocket = new THREE.Group();
+        backSocket.name = 'weaponSocketBack';
+        backSocket.position.set(0, proportions.torsoHeight * 0.3, -0.2); // Positioned on the upper back
+        backSocket.rotation.x = -Math.PI * 0.25; // Angle the weapon slightly
+        torsoGroup.add(backSocket);
+        this.backSocket = backSocket;
+
+        // Lower torso (abdomen)
+        const lowerTorso = new THREE.Mesh(
+            new THREE.BoxGeometry(
+                proportions.hipWidth,
+                proportions.torsoHeight * 0.45,
+                proportions.depth || 0.25
+            ),
+            new THREE.MeshStandardMaterial({ color: 0x2c3e50 })
         );
-        hair.position.y = 1.7;
-        character.add(hair);
+        lowerTorso.position.y = -proportions.torsoHeight * 0.225;
+        lowerTorso.castShadow = true;  // Enable shadow casting
+        torsoGroup.add(lowerTorso);
 
-        const torso = new THREE.Mesh(
-            new THREE.CylinderGeometry(0.25, 0.2, 0.6, 8),
-            clothMaterial
-        );
-        torso.position.y = 1.15;
-        character.add(torso);
-        this.torso = torso;
+        // Position torso
+        torsoGroup.position.y = proportions.legHeight;
 
-        // Arms setup
-        const createArmMeshes = (arm, isLeft) => {
-            const upperArm = new THREE.Mesh(
-                new THREE.CylinderGeometry(0.08, 0.07, 0.35),
-                clothMaterial
+        // Create legs with knees
+        const createLeg = (isLeft) => {
+            const legGroup = new THREE.Group();
+            
+            // Upper leg (thigh)
+            const thighGroup = new THREE.Group();
+            const thigh = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.1, 0.08, proportions.thighLength, 8),
+                new THREE.MeshStandardMaterial({ color: 0x2c3e50 })
             );
-            upperArm.position.y = -0.175;
+            thigh.position.y = -proportions.thighLength/2;
+            thigh.castShadow = true;  // Enable shadow casting
+            thighGroup.add(thigh);
+
+            // Knee joint
+            const knee = new THREE.Mesh(
+                new THREE.SphereGeometry(proportions.kneeRadius, 8, 8),
+                new THREE.MeshStandardMaterial({ color: 0x2c3e50 })
+            );
+            knee.position.y = -proportions.thighLength;
+            knee.castShadow = true;  // Enable shadow casting
+            thighGroup.add(knee);
+
+            // Lower leg (shin)
+            const shinGroup = new THREE.Group();
+            const shin = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.08, 0.06, proportions.shinLength, 8),
+                new THREE.MeshStandardMaterial({ color: 0x2c3e50 })
+            );
+            shin.position.y = -proportions.shinLength/2;
+            shin.castShadow = true;  // Enable shadow casting
+            shinGroup.add(shin);
+
+            // Position shin group at knee
+            shinGroup.position.y = -proportions.thighLength;
+            thighGroup.add(shinGroup);
+
+            // Add references for animation
+            if (isLeft) {
+                this.leftThigh = thighGroup;
+                this.leftShin = shinGroup;
+                this.leftKnee = knee;
+            } else {
+                this.rightThigh = thighGroup;
+                this.rightShin = shinGroup;
+                this.rightKnee = knee;
+            }
+
+            // Position entire leg
+            legGroup.add(thighGroup);
+            legGroup.position.y = proportions.legHeight;
+            legGroup.position.x = isLeft ? -proportions.hipWidth/3 : proportions.hipWidth/3;
+            
+            return legGroup;
+        };
+
+        // Create and add legs
+        const leftLeg = createLeg(true);
+        const rightLeg = createLeg(false);
+        character.add(leftLeg);
+        character.add(rightLeg);
+
+        // Create arms (existing code...)
+        const createArm = (isLeft) => {
+            const arm = new THREE.Group();
+            
+            // Upper arm
+            const upperArm = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.08, 0.07, proportions.torsoHeight * 0.6),
+                new THREE.MeshStandardMaterial({ color: 0x2c3e50 })
+            );
+            upperArm.position.y = -proportions.torsoHeight * 0.3;
+            upperArm.castShadow = true;
             arm.add(upperArm);
 
-            const lowerArm = new THREE.Mesh(
-                new THREE.CylinderGeometry(0.07, 0.06, 0.35),
-                skinMaterial
+            // Forearm
+            const forearm = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.07, 0.06, proportions.torsoHeight * 0.5),
+                new THREE.MeshStandardMaterial({ color: isLeft ? 0xffdbac : 0x00FF00 }) // Right arm green, left arm skin colored
             );
-            lowerArm.position.y = -0.525;
-            arm.add(lowerArm);
+            forearm.position.y = -proportions.torsoHeight * 0.85;
+            forearm.castShadow = true;
+            arm.add(forearm);
 
-            arm.position.y = 1.3;
-            arm.position.x = isLeft ? -0.35 : 0.35;
-        };
-
-        // Create arm meshes
-        createArmMeshes(this.leftArm, true);
-        createArmMeshes(this.rightArm, false);
-
-        // Add arms to character
-        character.add(this.leftArm);
-        character.add(this.rightArm);
-
-        console.log('Added arms to character:', {
-            leftArm: this.leftArm,
-            rightArm: this.rightArm
-        });
-
-        // Legs setup
-        const createLegMeshes = (leg, isLeft) => {
-            const upperLeg = new THREE.Mesh(
-                new THREE.CylinderGeometry(0.1, 0.09, 0.4),
-                clothMaterial
-            );
-            upperLeg.position.y = -0.2;
-            leg.add(upperLeg);
-
-            const lowerLeg = new THREE.Mesh(
-                new THREE.CylinderGeometry(0.09, 0.08, 0.4),
-                skinMaterial
-            );
-            lowerLeg.position.y = -0.6;
-            leg.add(lowerLeg);
-
-            const shoe = new THREE.Mesh(
-                new THREE.BoxGeometry(0.15, 0.1, 0.25),
-                shoeMaterial
-            );
-            shoe.position.y = -0.8;
-            shoe.position.z = 0.05;
-            leg.add(shoe);
-
-            leg.position.y = 0.85;
-            leg.position.x = isLeft ? -0.15 : 0.15;
-        };
-
-        // Create leg meshes
-        createLegMeshes(this.leftLeg, true);
-        createLegMeshes(this.rightLeg, false);
-
-        // Add legs to character
-        character.add(this.leftLeg);
-        character.add(this.rightLeg);
-
-        // Create and add right hand
-        this.rightHand = new THREE.Group();
-        this.rightHand.position.set(0, -0.525, 0);
-        this.rightArm.add(this.rightHand);
-
-        // Add katana if it exists
-        if (this.katana) {
-            this.katana.position.set(0.1, 0, 0.2);
-            this.katana.rotation.set(0, 0, Math.PI / 4);
-            this.rightHand.add(this.katana);
-        }
-
-        // Set character position and shadows
-        character.position.y = 0;
-        character.castShadow = true;
-        character.traverse((object) => {
-            if (object instanceof THREE.Mesh) {
-                object.castShadow = true;
-                object.receiveShadow = true;
+            // Add weapon socket ONLY to right arm
+            if (isLeft) {  // This is the left arm
+                const handSocket = new THREE.Group();
+                handSocket.name = 'weaponSocketHand';
+                // Add visible debug sphere to socket
+                const socketDebug = new THREE.Mesh(
+                    new THREE.SphereGeometry(0.05, 8, 8),
+                    new THREE.MeshBasicMaterial({ color: 0xFF0000 })
+                );
+                handSocket.add(socketDebug);
+                // Position socket at the end of the right forearm
+                handSocket.position.set(0, -proportions.torsoHeight * 0.1, 0);
+                handSocket.rotation.set(1.5, 0, -0.5);
+                forearm.add(handSocket);  // Attach to forearm
+                this.handSocket = handSocket;
             }
-        });
 
-        console.log('Final limb references before returning character:', {
-            leftLeg: this.leftLeg,
-            rightLeg: this.rightLeg,
-            leftArm: this.leftArm,
-            rightArm: this.rightArm,
-            rightHand: this.rightHand
-        });
+            // Position the entire arm relative to the torso
+            arm.position.y = proportions.torsoHeight * 0.5;
+            arm.position.x = isLeft ? -proportions.shoulderWidth/2 : proportions.shoulderWidth/2;
+            
+            return arm;
+        };
+
+        // Create arms in correct order
+        const leftArm = createArm(true);   // Create left arm first
+        const rightArm = createArm(false); // Create right arm second
+        torsoGroup.add(leftArm);
+        torsoGroup.add(rightArm);
+        
+        // Swap the references while keeping physical positions the same
+        this.rightArm = leftArm;   // The green arm on the left is actually the right arm
+        this.leftArm = rightArm;   // The skin-colored arm on the right is actually the left arm
+
+        // Create head (existing code...)
+        const head = new THREE.Group();
+        const skull = new THREE.Mesh(
+            new THREE.SphereGeometry(proportions.headRadius, 24, 24),
+            new THREE.MeshStandardMaterial({ color: 0xffdbac })
+        );
+        skull.castShadow = true;  // Enable shadow casting
+        head.add(skull);
+        head.position.y = proportions.torsoHeight * 0.55 + 0.1;
+        torsoGroup.add(head);
+        this.head = head;  // Add head reference
+
+        // Add torso to character
+        character.add(torsoGroup);
+        this.torso = torsoGroup;
+
+        // Create katana with socket
+        if (this.katana) {
+            // Position katana relative to hand socket
+            this.katana.scale.set(0.8, 0.8, 0.8);
+            this.katana.position.set(0, 0, 0);
+            this.katana.rotation.set(0, Math.PI * 0.5, 0);
+
+            // Attach katana to hand socket by default
+            if (this.handSocket) {
+                this.handSocket.add(this.katana);
+            }
+        }
 
         return character;
     }
@@ -349,15 +464,18 @@ class Game {
         directionalLight.position.set(50, 100, 50);
         directionalLight.castShadow = true;
         
-        // Adjust shadow properties
-        directionalLight.shadow.mapSize.width = 2048;
-        directionalLight.shadow.mapSize.height = 2048;
+        // Adjust shadow properties for better quality
+        directionalLight.shadow.mapSize.width = 4096;  // Increased resolution
+        directionalLight.shadow.mapSize.height = 4096;  // Increased resolution
         directionalLight.shadow.camera.near = 0.5;
         directionalLight.shadow.camera.far = 500;
-        directionalLight.shadow.camera.left = -100;
-        directionalLight.shadow.camera.right = 100;
-        directionalLight.shadow.camera.top = 100;
-        directionalLight.shadow.camera.bottom = -100;
+        directionalLight.shadow.camera.left = -50;     // Reduced shadow camera size
+        directionalLight.shadow.camera.right = 50;     // for sharper shadows
+        directionalLight.shadow.camera.top = 50;
+        directionalLight.shadow.camera.bottom = -50;
+        directionalLight.shadow.bias = -0.001;         // Reduce shadow acne
+        directionalLight.shadow.normalBias = 0.05;     // Improve contact shadows
+        directionalLight.shadow.radius = 1.5;          // Soften shadow edges
         
         this.scene.add(directionalLight);
 
@@ -461,109 +579,368 @@ class Game {
             new THREE.BoxGeometry(0.05, 1, 0.1),
             new THREE.MeshPhongMaterial({ color: 0xCCCCCC })
         );
-        blade.position.y = 0.5;
+        blade.position.y = 0.5; // Position relative to handle
+        blade.castShadow = true;
         
         // Handle
         const handle = new THREE.Mesh(
             new THREE.CylinderGeometry(0.03, 0.03, 0.3, 8),
             new THREE.MeshPhongMaterial({ color: 0x4A4A4A })
         );
-        handle.position.y = -0.1;
+        handle.position.y = 0; // At the base, this is our pivot point
+        handle.castShadow = true;
         
         // Guard
         const guard = new THREE.Mesh(
             new THREE.BoxGeometry(0.2, 0.05, 0.05),
             new THREE.MeshPhongMaterial({ color: 0x8B4513 })
         );
+        guard.position.y = 0.15; // Just above handle
+        guard.castShadow = true;
         
         katanaGroup.add(blade, handle, guard);
-        katanaGroup.position.set(0.4, 1.2, 0);
-        katanaGroup.rotation.z = Math.PI / 4;
-        
         return katanaGroup;
     }
 
     updateCharacter() {
-        if (!this.character) {
-            console.error('No character found');
-            return;
+        if (!this.character) return;
+
+        const time = Date.now() * 0.003;
+        const deltaTime = 1/60;  // Assuming 60 FPS
+        const speed = this.momentum.length();
+
+        // Apply gravity and update position
+        if (!this.isGrounded) {
+            this.velocity.y += this.gravity;
+            this.character.position.y += this.velocity.y;
+
+            // Update roll animation
+            if (this.isRolling) {
+                this.rollTime += deltaTime;
+                if (this.rollTime >= this.rollDuration) {
+                    this.isRolling = false;
+                }
+            }
+
+            // Check for ground collision
+            if (this.character.position.y <= this.groundLevel) {
+                this.character.position.y = this.groundLevel;
+                this.velocity.y = 0;
+                this.isGrounded = true;
+                this.isRolling = false;  // End roll when landing
+            }
         }
 
-        // Debug check for limbs
-        if (!this.leftLeg || !this.rightLeg || !this.leftArm || !this.rightArm) {
-            console.error('Missing limb references:', {
-                leftLeg: this.leftLeg,
-                rightLeg: this.rightLeg,
-                leftArm: this.leftArm,
-                rightArm: this.rightArm
-            });
-            return;
+        // Update jump cooldown
+        if (!this.canJump) {
+            this.jumpCooldown -= deltaTime;
+            if (this.jumpCooldown <= 0) {
+                this.canJump = true;
+            }
         }
 
-        // Get camera's forward and right vectors
-        const forward = new THREE.Vector3(0, 0, -1);
-        forward.applyQuaternion(this.camera.quaternion);
-        forward.y = 0;
-        forward.normalize();
-
-        const right = new THREE.Vector3(1, 0, 0);
-        right.applyQuaternion(this.camera.quaternion);
-        right.y = 0;
-        right.normalize();
-
-        // Calculate movement direction
-        this.moveDirection.set(0, 0, 0);
-        if (this.keys.forward) this.moveDirection.add(forward);
-        if (this.keys.backward) this.moveDirection.sub(forward);
-        if (this.keys.right) this.moveDirection.add(right);
-        if (this.keys.left) this.moveDirection.sub(right);
-        this.moveDirection.normalize();
-
-        // Animation state
-        const isMoving = this.moveDirection.length() > 0;
-        const isRunning = this.keys.shift && isMoving;
-        const currentSpeed = isRunning ? this.maxRunSpeed : this.maxWalkSpeed;
-        const time = Date.now() * 0.005; // Back to original speed
-
-        if (isMoving) {
-            console.log('Moving:', {
-                isRunning,
-                speed: currentSpeed,
-                direction: this.moveDirection
-            });
-        }
-
-        // Apply movement
-        if (isMoving) {
-            this.character.position.x += this.moveDirection.x * currentSpeed;
-            this.character.position.z += this.moveDirection.z * currentSpeed;
-
-            // Rotate character to face movement direction
-            const targetAngle = Math.atan2(this.moveDirection.x, this.moveDirection.z);
-            this.rotationAngle = this.smoothAngle(this.rotationAngle, targetAngle, 0.2);
-            this.character.rotation.y = this.rotationAngle;
-
-            // Walking animation
-            const walkCycle = time;
-            const amplitude = isRunning ? 0.5 : 0.3;
-
-            // Apply animations
-            this.leftLeg.rotation.x = Math.sin(walkCycle) * amplitude;
-            this.rightLeg.rotation.x = -Math.sin(walkCycle) * amplitude;
-            this.leftArm.rotation.x = -Math.sin(walkCycle) * amplitude;
-            this.rightArm.rotation.x = Math.sin(walkCycle) * amplitude;
-
-            console.log('Animations:', {
-                walkCycle,
-                leftLegRot: this.leftLeg.rotation.x,
-                rightLegRot: this.rightLeg.rotation.x
-            });
+        // Determine character state
+        if (!this.isGrounded) {
+            this.characterState = this.isRolling ? 'rolling' : 'jumping';
+        } else if (this.isSliding) {
+            this.characterState = 'sliding';
+        } else if (this.isDashing) {
+            this.characterState = 'dashing';
+        } else if (this.keys.shift && speed > 0.002) {
+            this.characterState = 'sprinting';
+        } else if (speed > 0.001) {
+            this.characterState = 'walking';
         } else {
-            // Reset to idle pose
-            this.leftLeg.rotation.x = 0;
-            this.rightLeg.rotation.x = 0;
-            this.leftArm.rotation.x = 0;
-            this.rightArm.rotation.x = 0;
+            this.characterState = 'idle';
+        }
+
+        // Handle weapon socket based on state
+        if (this.characterState === 'sprinting' && this.katana && this.backSocket) {
+            if (this.katana.parent !== this.backSocket) {
+                this.switchWeaponSocket(true);
+            }
+        } else if (this.katana && this.handSocket) {
+            if (this.katana.parent !== this.handSocket) {
+                this.switchWeaponSocket(false);
+            }
+        }
+
+        // Apply animations based on state
+        if (this.leftThigh && this.rightThigh && this.leftShin && this.rightShin) {
+            switch (this.characterState) {
+                case 'rolling':
+                    // Rolling animation
+                    const rollProgress = this.rollTime / this.rollDuration;
+                    const rollAngle = Math.PI * 2 * rollProgress;  // Full 360-degree rotation
+                    
+                    // Curl factor increases then decreases during roll
+                    const curlProgress = Math.sin(rollProgress * Math.PI); // 0 -> 1 -> 0
+                    
+                    // Rotate entire character forward from lower torso pivot
+                    this.torso.rotation.x = rollAngle;
+                    
+                    // Curl legs up tight towards chest
+                    this.leftThigh.rotation.x = -2.0 * curlProgress;  // Legs curl up tighter
+                    this.rightThigh.rotation.x = -2.0 * curlProgress;
+                    this.leftShin.rotation.x = 2.4 * curlProgress;   // Knees bend more
+                    this.rightShin.rotation.x = 2.4 * curlProgress;
+                    
+                    // Arms wrap around legs
+                    this.leftArm.rotation.x = -2.2 * curlProgress;  // Arms wrap further
+                    this.rightArm.rotation.x = -2.2 * curlProgress;
+                    this.leftArm.rotation.z = 1.0 * curlProgress;   // Arms hug inward
+                    this.rightArm.rotation.z = -1.0 * curlProgress;
+                    
+                    // Torso curls forward
+                    this.torso.rotation.x = 0.8 * curlProgress + rollAngle; // Base curl plus rotation
+                    
+                    // Head tucks in
+                    if (this.head) {
+                        this.head.rotation.x = -0.8 * curlProgress; // Tuck chin to chest
+                    }
+                    
+                    // Reset all rotations at end of roll
+                    if (rollProgress >= 1) {
+                        this.torso.rotation.x = 0;
+                        if (this.head) {
+                            this.head.rotation.x = 0;
+                        }
+                    }
+                    break;
+
+                case 'jumping':
+                    // Existing jumping animation
+                    const jumpProgress = Math.max(0, Math.min(1, this.velocity.y / this.jumpForce));
+                    
+                    // Reset character rotation in case coming from roll
+                    this.character.rotation.x = 0;
+                    
+                    // Legs bend up during jump
+                    this.leftThigh.rotation.x = -0.6 * jumpProgress;
+                    this.rightThigh.rotation.x = -0.6 * jumpProgress;
+                    this.leftShin.rotation.x = 1.2 * jumpProgress;
+                    this.rightShin.rotation.x = 1.2 * jumpProgress;
+                    
+                    // Arms raise up during jump
+                    this.leftArm.rotation.x = -0.8 * jumpProgress;
+                    this.rightArm.rotation.x = -0.8 * jumpProgress;
+                    this.leftArm.rotation.z = 0.3 * jumpProgress;
+                    this.rightArm.rotation.z = -0.3 * jumpProgress;
+                    
+                    // Slight forward lean
+                    this.torso.rotation.x = 0.2 * jumpProgress;
+                    break;
+
+                case 'idle':
+                    // Subtle breathing animation
+                    const breatheAmp = 0.005;
+                    const breatheSpeed = 1.5;
+                    
+                    // Torso subtle forward lean and breathing
+                    this.torso.rotation.x = 0.1; // Slight combat-ready hunch
+                    this.torso.rotation.y = Math.sin(time * breatheSpeed) * breatheAmp;
+                    
+                    // Slightly bent knees in ready stance
+                    this.leftThigh.rotation.x = -0.1;  // Slight bend at hip
+                    this.rightThigh.rotation.x = -0.1;
+                    this.leftShin.rotation.x = 0.2;   // Compensating bend at knee
+                    this.rightShin.rotation.x = 0.2;
+                    
+                    // Subtle arm positioning - adjusted to prevent clipping
+                    this.leftArm.rotation.x = -0.1;
+                    this.rightArm.rotation.x = -0.1;
+                    this.leftArm.rotation.y = 0.4;    // Rotate around Y-axis to pivot from shoulder
+                    this.rightArm.rotation.y = -0.4;  // Negative for right arm to mirror the left
+                    this.leftArm.rotation.z = 0;      // Remove Z rotation since we're using Y
+                    this.rightArm.rotation.z = 0;     // Remove Z rotation since we're using Y
+                    break;
+
+                case 'walking':
+                    const walkSpeed = 3.0;      // Increased from 2.0
+                    const walkAmp = 0.3;
+                    const kneeAmp = 0.4;  // Additional bend for knees
+                    
+                    // Leg movement
+                    this.leftThigh.rotation.x = Math.sin(time * walkSpeed) * walkAmp;
+                    this.rightThigh.rotation.x = -Math.sin(time * walkSpeed) * walkAmp;
+                    
+                    // Knee bending - opposite phase of thigh for natural walking
+                    this.leftShin.rotation.x = Math.max(0, Math.sin(time * walkSpeed + Math.PI) * kneeAmp);
+                    this.rightShin.rotation.x = Math.max(0, -Math.sin(time * walkSpeed + Math.PI) * kneeAmp);
+                    
+                    // Arm swing - opposite of legs for natural walking (right arm with left leg)
+                    const walkArmBase = 0.25; // Base outward rotation to prevent clipping
+                    this.leftArm.rotation.x = Math.sin(time * walkSpeed) * walkAmp * 0.8;  // Changed to match opposite leg
+                    this.rightArm.rotation.x = -Math.sin(time * walkSpeed) * walkAmp * 0.8; // Changed to match opposite leg
+                    this.leftArm.rotation.y = 0.3 + Math.sin(time * walkSpeed) * 0.1;
+                    this.rightArm.rotation.y = -0.3 + Math.sin(time * walkSpeed) * 0.1;
+                    this.leftArm.rotation.z = 0;
+                    this.rightArm.rotation.z = 0;
+                    
+                    // Subtle torso movement
+                    this.torso.rotation.y = Math.sin(time * walkSpeed) * 0.05;
+                    this.torso.rotation.x = 0.05; // Slight forward lean
+                    break;
+
+                case 'sprinting':
+                    const sprintSpeed = 3.6;    // Increased from 2.4
+                    const sprintAmp = 0.5;
+                    const sprintKneeAmp = 0.7;  // More pronounced knee bend for running
+                    
+                    // Leg movement
+                    this.leftThigh.rotation.x = Math.sin(time * sprintSpeed) * sprintAmp;
+                    this.rightThigh.rotation.x = -Math.sin(time * sprintSpeed) * sprintAmp;
+                    
+                    // Exaggerated knee bending for running
+                    this.leftShin.rotation.x = Math.max(0, Math.sin(time * sprintSpeed + Math.PI) * sprintKneeAmp);
+                    this.rightShin.rotation.x = Math.max(0, -Math.sin(time * sprintSpeed + Math.PI) * sprintKneeAmp);
+                    
+                    // Naruto run arm positioning - arms straight back
+                    this.leftArm.rotation.x = 1.2;  // Rotate arms back
+                    this.rightArm.rotation.x = 1.2;
+                    this.leftArm.rotation.y = 0;    // No side rotation
+                    this.rightArm.rotation.y = 0;
+                    this.leftArm.rotation.z = 0;    // No Z rotation
+                    this.rightArm.rotation.z = 0;
+                    
+                    // Forward lean
+                    this.torso.rotation.x = 0.4; // More pronounced forward lean for Naruto run
+                    this.torso.rotation.y = Math.sin(time * sprintSpeed) * 0.08;
+                    break;
+
+                case 'sliding':
+                    const slideProgress = this.slideTime / this.maxSlideTime;
+                    const slideAngle = Math.PI / 3;
+                    
+                    // Torso lean
+                    this.torso.rotation.x = slideAngle;
+                    
+                    // Leg positioning during slide
+                    this.leftThigh.rotation.x = slideAngle * 0.7;
+                    this.rightThigh.rotation.x = slideAngle * 0.7;
+                    this.leftShin.rotation.x = -slideAngle * 0.3;  // Bend knees inward
+                    this.rightShin.rotation.x = -slideAngle * 0.3;
+                    
+                    // Arm positioning - adjusted to prevent clipping during slide
+                    const slideArmBase = 0.4; // Wide outward angle during slide
+                    this.leftArm.rotation.x = -slideAngle * 0.5;
+                    this.rightArm.rotation.x = -slideAngle * 0.5;
+                    this.leftArm.rotation.z = slideArmBase;   // Constant wide position for balance
+                    this.rightArm.rotation.z = -slideArmBase;
+                    
+                    // Recovery animation
+                    if (slideProgress > 0.7) {
+                        const recovery = (slideProgress - 0.7) / 0.3;
+                        const recoveryEase = 1 - recovery;
+                        
+                        // Smoothly return to normal stance
+                        this.torso.rotation.x *= recoveryEase;
+                        this.leftThigh.rotation.x *= recoveryEase;
+                        this.rightThigh.rotation.x *= recoveryEase;
+                        this.leftShin.rotation.x *= recoveryEase;
+                        this.rightShin.rotation.x *= recoveryEase;
+                        this.leftArm.rotation.x *= recoveryEase;
+                        this.rightArm.rotation.x *= recoveryEase;
+                        // Maintain minimum outward angle during recovery
+                        this.leftArm.rotation.z = slideArmBase * recoveryEase + 0.3;
+                        this.rightArm.rotation.z = -slideArmBase * recoveryEase - 0.3;
+                    }
+                    break;
+
+                case 'dashing':
+                    // Dynamic dash animation
+                    const dashProgress = Math.min((Date.now() - this.dashStartTime) / 300, 1);
+                    
+                    // Forward lean during dash
+                    this.torso.rotation.x = 0.6;
+                    
+                    // Arms stretched back like a ninja run
+                    this.leftArm.rotation.x = 1.5;
+                    this.rightArm.rotation.x = 1.5;
+                    this.leftArm.rotation.z = -0.2;
+                    this.rightArm.rotation.z = 0.2;
+                    
+                    // Legs in running position
+                    this.leftThigh.rotation.x = -0.4;
+                    this.rightThigh.rotation.x = 0.4;
+                    this.leftShin.rotation.x = 0.8;
+                    this.rightShin.rotation.x = 0;
+                    
+                    // Add slight body rotation for dynamic effect
+                    this.torso.rotation.y = Math.sin(dashProgress * Math.PI) * 0.2;
+                    break;
+            }
+        }
+
+        // Update character rotation based on movement direction
+        if (this.momentum.lengthSq() > 0.001) {
+            const targetRotation = Math.atan2(this.momentum.x, this.momentum.z);
+            this.character.rotation.y = this.smoothAngle(
+                this.character.rotation.y,
+                targetRotation,
+                0.15
+            );
+        }
+
+        // Update slide mechanics
+        if (this.slideCooldown > 0) {
+            this.slideCooldown -= 1/60;
+            if (this.slideCooldown <= 0) {
+                this.canSlide = true;
+            }
+        }
+
+        // Handle sliding movement
+        if (this.isSliding) {
+            this.slideTime += 1/60;
+            if (this.slideTime >= this.maxSlideTime) {
+                this.cancelSlide();
+            }
+
+            const slideDecay = 1 - (this.slideTime / this.maxSlideTime);
+            this.character.position.add(
+                this.momentum.clone().multiplyScalar(slideDecay)
+            );
+        } else {
+            // Normal movement
+            const moveDir = new THREE.Vector3(0, 0, 0);
+            if (this.keys.forward) moveDir.z += 1;
+            if (this.keys.backward) moveDir.z -= 1;
+            if (this.keys.left) moveDir.x -= 1;  // Keep negative for left
+            if (this.keys.right) moveDir.x += 1;  // Keep positive for right
+
+            if (moveDir.lengthSq() > 0) {
+                moveDir.normalize();
+                
+                const cameraDirection = new THREE.Vector3();
+                this.camera.getWorldDirection(cameraDirection);
+                cameraDirection.y = 0;
+                cameraDirection.normalize();
+
+                const right = new THREE.Vector3();
+                right.crossVectors(new THREE.Vector3(0, 1, 0), cameraDirection);
+
+                const movement = new THREE.Vector3();
+                movement.addScaledVector(cameraDirection, moveDir.z);
+                movement.addScaledVector(right, -moveDir.x);  // Add negative here to fix left/right inversion
+                movement.normalize();
+                movement.multiplyScalar(this.keys.shift ? this.maxRunSpeed : this.maxWalkSpeed);
+
+                this.momentum.lerp(movement, 0.2);
+                this.character.position.add(this.momentum);
+
+                // Update character rotation to face movement direction
+                if (this.momentum.lengthSq() > 0.00001) {  // Lower threshold for rotation
+                    const targetRotation = Math.atan2(this.momentum.x, this.momentum.z);
+                    this.character.rotation.y = this.smoothAngle(
+                        this.character.rotation.y,
+                        targetRotation,
+                        0.3  // Increased smoothing factor for more responsive turning
+                    );
+                }
+            } else {
+                this.momentum.multiplyScalar(0.9);
+            }
         }
 
         // Update OrbitControls
@@ -739,29 +1116,43 @@ class Game {
     }
 
     startSlide() {
-        if (!this.canSlide) return;
+        // Remove sprint requirement for sliding
+        if (!this.canSlide || this.isSliding) return;
         
         this.isSliding = true;
+        this.slideTime = 0;
         this.canSlide = false;
-        this.character.scale.y = 0.5;
         
-        // Preserve current momentum and add slide boost
-        const slideDirection = this.moveDirection.clone().normalize();
-        const currentHorizontalSpeed = new THREE.Vector3(this.velocity.x, 0, this.velocity.z).length();
-        const slideSpeed = Math.max(currentHorizontalSpeed, this.maxRunSpeed) * this.slideForce;
-        
-        this.velocity.x = slideDirection.x * slideSpeed;
-        this.velocity.z = slideDirection.z * slideSpeed;
+        // Store current movement direction for slide
+        const moveDir = new THREE.Vector3(0, 0, 0);
+        if (this.keys.forward) moveDir.z += 1;
+        if (this.keys.backward) moveDir.z -= 1;
+        if (this.keys.left) moveDir.x += 1;
+        if (this.keys.right) moveDir.x -= 1;
+        moveDir.normalize();
 
-        setTimeout(() => {
-            this.isSliding = false;
-            this.character.scale.y = 1;
-            // Preserve more momentum after slide
-            this.velocity.multiplyScalar(0.85);
-            setTimeout(() => {
-                this.canSlide = true;
-            }, 300); // Shorter cooldown
-        }, 800); // Longer slide duration
+        // Get camera direction
+        const cameraDirection = new THREE.Vector3();
+        this.camera.getWorldDirection(cameraDirection);
+        cameraDirection.y = 0;
+        cameraDirection.normalize();
+
+        // Calculate right vector from camera direction
+        const right = new THREE.Vector3();
+        right.crossVectors(new THREE.Vector3(0, 1, 0), cameraDirection);
+
+        // Apply slide direction relative to camera
+        this.momentum.set(0, 0, 0);
+        this.momentum.addScaledVector(cameraDirection, moveDir.z);
+        this.momentum.addScaledVector(right, moveDir.x);
+        this.momentum.normalize();
+        this.momentum.multiplyScalar(this.slideSpeed);
+    }
+
+    cancelSlide() {
+        this.isSliding = false;
+        this.slideCooldown = this.maxSlideCooldown;
+        this.momentum.multiplyScalar(0.5); // Maintain some momentum after canceling
     }
 
     performDash() {
@@ -769,35 +1160,68 @@ class Game {
 
         this.canDash = false;
         this.isDashing = true;
+        this.dashStartTime = Date.now();
         
-        const dashDirection = this.moveDirection.clone().normalize();
-        this.velocity.x = dashDirection.x * this.dashForce;
-        this.velocity.z = dashDirection.z * this.dashForce;
+        const dashDirection = new THREE.Vector3();
+        if (this.keys.forward) dashDirection.z += 1;
+        if (this.keys.backward) dashDirection.z -= 1;
+        if (this.keys.left) dashDirection.x -= 1;
+        if (this.keys.right) dashDirection.x += 1;
+        
+        if (dashDirection.lengthSq() === 0) {
+            // If no direction pressed, dash in facing direction
+            dashDirection.z = Math.cos(this.character.rotation.y);
+            dashDirection.x = Math.sin(this.character.rotation.y);
+        }
+        
+        // Apply dash in the direction of camera
+        const cameraDirection = new THREE.Vector3();
+        this.camera.getWorldDirection(cameraDirection);
+        cameraDirection.y = 0;
+        cameraDirection.normalize();
+
+        const right = new THREE.Vector3();
+        right.crossVectors(new THREE.Vector3(0, 1, 0), cameraDirection);
+
+        this.momentum.set(0, 0, 0);
+        this.momentum.addScaledVector(cameraDirection, dashDirection.z);
+        this.momentum.addScaledVector(right, dashDirection.x);
+        this.momentum.normalize();
+        this.momentum.multiplyScalar(this.dashForce);
 
         // Add slight upward force to dash
-        this.velocity.y = 0.1;
+        this.velocity.y = this.isGrounded ? 0.1 : 0.2; // Higher upward force when air dashing
 
         setTimeout(() => {
             this.isDashing = false;
-            this.velocity.multiplyScalar(0.7); // Preserve more momentum
+            this.momentum.multiplyScalar(0.7); // Preserve some momentum
             setTimeout(() => {
                 this.canDash = true;
-            }, 300); // Shorter cooldown
-        }, 300); // Longer dash duration
+            }, 300); // Cooldown duration
+        }, 300); // Dash duration
     }
 
-    performAirDash() {
-        if (!this.canDash) return;
-
-        this.canDash = false;
-        const dashDirection = this.moveDirection.clone().normalize();
-        this.velocity.x = dashDirection.x * this.dashForce;
-        this.velocity.z = dashDirection.z * this.dashForce;
-        this.velocity.y = 0.2;
-
-        setTimeout(() => {
-            this.canDash = true;
-        }, 1000);
+    // Add method to switch weapon position
+    switchWeaponSocket(toBack = false) {
+        if (!this.katana) return;
+        
+        // Remove katana from current socket
+        if (this.katana.parent) {
+            this.katana.parent.remove(this.katana);
+        }
+        
+        // Add to new socket
+        if (toBack && this.backSocket) {
+            this.backSocket.add(this.katana);
+            // Adjust position/rotation for back
+            this.katana.position.set(0, 0, 0);
+            this.katana.rotation.set(0, 0, Math.PI * 0.75);
+        } else if (this.handSocket) {
+            this.handSocket.add(this.katana);
+            // Position and rotate for hand grip
+            this.katana.position.set(0, 0, 0);
+            this.katana.rotation.set(0, Math.PI * 0.5, 0);
+        }
     }
 }
 
