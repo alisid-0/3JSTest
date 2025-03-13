@@ -63,7 +63,7 @@ class Game {
         this.gravity = -0.0015;  // Reduced from -0.005 for longer hang time
         this.jumpForce = 0.12;  // Adjusted first jump force
         this.doubleJumpForce = 0.10;  // Adjusted second jump force
-        this.dashForce = 1.2;
+        this.dashForce = 0.15;   // Reduced from 1.2 to be 2.5x sprint speed
         this.slideForce = 0.8;
         this.isGrounded = true;
         this.groundLevel = 0;
@@ -85,9 +85,10 @@ class Game {
         // Movement constants
         this.maxWalkSpeed = 0.03;      // Very slow walk
         this.maxRunSpeed = 0.06;       // Very slow run
-        this.acceleration = 0.01;
+        this.acceleration = 0.005;      // Reduced from 0.01 for smoother acceleration
         this.deceleration = 0.95;
         this.airControl = 0.4;
+        this.maxAcceleration = 0.008;   // Maximum acceleration per frame
 
         // Combat
         this.katanaBaseRotation = new THREE.Euler(0, 0, Math.PI / 4);
@@ -202,6 +203,9 @@ class Game {
             }
         });
 
+        // Create HUD
+        this.createHUD();
+
         // Animation loop
         this.animate();
 
@@ -215,6 +219,11 @@ class Game {
             leftArm: this.leftArm,
             rightArm: this.rightArm
         });
+
+        // Add dash decay properties
+        this.dashDecayStartTime = 0;
+        this.dashDecayDuration = 4000; // 4 seconds before speed starts decaying
+        this.dashSpeedRetained = 0; // Store the speed we want to maintain
     }
 
     createCharacter() {
@@ -602,6 +611,67 @@ class Game {
         return katanaGroup;
     }
 
+    createHUD() {
+        // Create HUD container
+        const hudContainer = document.createElement('div');
+        hudContainer.style.position = 'fixed';
+        hudContainer.style.top = '10px';
+        hudContainer.style.left = '10px';
+        hudContainer.style.padding = '10px';
+        hudContainer.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+        hudContainer.style.color = 'white';
+        hudContainer.style.fontFamily = 'monospace';
+        hudContainer.style.fontSize = '14px';
+        hudContainer.style.borderRadius = '5px';
+        hudContainer.style.zIndex = '1000';
+
+        // Create stat elements
+        this.speedDisplay = document.createElement('div');
+        this.momentumDisplay = document.createElement('div');
+        this.stateDisplay = document.createElement('div');
+        this.dashDisplay = document.createElement('div');
+        this.jumpDisplay = document.createElement('div');
+        this.dashDecayDisplay = document.createElement('div');  // New element for dash decay timer
+
+        // Add elements to container
+        hudContainer.appendChild(this.speedDisplay);
+        hudContainer.appendChild(this.momentumDisplay);
+        hudContainer.appendChild(this.stateDisplay);
+        hudContainer.appendChild(this.dashDisplay);
+        hudContainer.appendChild(this.jumpDisplay);
+        hudContainer.appendChild(this.dashDecayDisplay);  // Add new element to container
+
+        // Add to document
+        document.body.appendChild(hudContainer);
+    }
+
+    updateHUD() {
+        // Calculate current speed
+        const speed = this.momentum.length();
+        const momentumX = this.momentum.x.toFixed(3);
+        const momentumZ = this.momentum.z.toFixed(3);
+        
+        // Update displays
+        this.speedDisplay.textContent = `Speed: ${speed.toFixed(3)}`;
+        this.momentumDisplay.textContent = `Momentum: X:${momentumX} Z:${momentumZ}`;
+        this.stateDisplay.textContent = `State: ${this.characterState}`;
+        this.dashDisplay.textContent = `Dash Ready: ${this.canDash ? 'Yes' : 'No'}`;
+        this.jumpDisplay.textContent = `Double Jump: ${this.hasDoubleJump ? 'Available' : 'Used'}`;
+
+        // Update dash decay timer if active
+        if (this.dashDecayStartTime > 0) {
+            const now = Date.now();
+            const timeLeft = Math.max(0, (this.dashDecayStartTime + this.dashDecayDuration - now) / 1000);
+            if (timeLeft > 0) {
+                this.dashDecayDisplay.textContent = `Speed Decay in: ${timeLeft.toFixed(1)}s`;
+            } else {
+                this.dashDecayDisplay.textContent = 'Speed Decaying...';
+            }
+        } else {
+            this.dashDecayDisplay.textContent = '';
+        }
+    }
+
     updateCharacter() {
         if (!this.character) return;
 
@@ -906,8 +976,8 @@ class Game {
             const moveDir = new THREE.Vector3(0, 0, 0);
             if (this.keys.forward) moveDir.z += 1;
             if (this.keys.backward) moveDir.z -= 1;
-            if (this.keys.left) moveDir.x -= 1;  // Keep negative for left
-            if (this.keys.right) moveDir.x += 1;  // Keep positive for right
+            if (this.keys.left) moveDir.x -= 1;
+            if (this.keys.right) moveDir.x += 1;
 
             if (moveDir.lengthSq() > 0) {
                 moveDir.normalize();
@@ -922,26 +992,70 @@ class Game {
 
                 const movement = new THREE.Vector3();
                 movement.addScaledVector(cameraDirection, moveDir.z);
-                movement.addScaledVector(right, -moveDir.x);  // Add negative here to fix left/right inversion
+                movement.addScaledVector(right, -moveDir.x);
                 movement.normalize();
-                movement.multiplyScalar(this.keys.shift ? this.maxRunSpeed : this.maxWalkSpeed);
 
-                this.momentum.lerp(movement, 0.2);
+                // Calculate target speed based on current state
+                let targetSpeed = this.keys.shift ? this.maxRunSpeed : this.maxWalkSpeed;
+
+                // Check if we're in the dash speed retention period
+                const now = Date.now();
+                if (this.dashDecayStartTime > 0) {
+                    const timeSinceDash = now - this.dashDecayStartTime;
+                    if (timeSinceDash < this.dashDecayDuration) {
+                        // During retention period, maintain dash speed
+                        targetSpeed = this.dashSpeedRetained;
+                    } else {
+                        // After retention period, gradually decay speed
+                        const decayProgress = Math.min(1, (timeSinceDash - this.dashDecayDuration) / 2000);
+                        targetSpeed = this.dashSpeedRetained * (1 - decayProgress) + 
+                                    (this.keys.shift ? this.maxRunSpeed : this.maxWalkSpeed) * decayProgress;
+                    }
+                }
+
+                movement.multiplyScalar(targetSpeed);
+
+                // Calculate current speed and direction
+                const currentSpeed = this.momentum.length();
+                
+                // Calculate acceleration based on speed difference
+                const speedDiff = targetSpeed - currentSpeed;
+                const accelerationThisFrame = Math.min(
+                    Math.abs(speedDiff),
+                    this.maxAcceleration
+                ) * Math.sign(speedDiff);
+
+                // Apply smoother acceleration
+                const lerpFactor = Math.min(
+                    0.05 + Math.abs(accelerationThisFrame) * 2,
+                    this.isGrounded ? 0.15 : 0.08
+                );
+
+                this.momentum.lerp(movement, lerpFactor);
+                
                 this.character.position.add(this.momentum);
 
                 // Update character rotation to face movement direction
-                if (this.momentum.lengthSq() > 0.00001) {  // Lower threshold for rotation
+                if (this.momentum.lengthSq() > 0.00001) {
                     const targetRotation = Math.atan2(this.momentum.x, this.momentum.z);
                     this.character.rotation.y = this.smoothAngle(
                         this.character.rotation.y,
                         targetRotation,
-                        0.3  // Increased smoothing factor for more responsive turning
+                        0.15
                     );
                 }
             } else {
-                this.momentum.multiplyScalar(0.9);
+                // Only apply deceleration if we're not in the dash retention period
+                const now = Date.now();
+                if (this.dashDecayStartTime === 0 || (now - this.dashDecayStartTime) >= this.dashDecayDuration) {
+                    const deceleration = this.isGrounded ? 0.98 : 0.995;
+                    this.momentum.multiplyScalar(deceleration);
+                }
             }
         }
+
+        // Update HUD at the end of character update
+        this.updateHUD();
 
         // Update OrbitControls
         this.controls.target.copy(this.character.position);
@@ -1161,44 +1275,63 @@ class Game {
         this.canDash = false;
         this.isDashing = true;
         this.dashStartTime = Date.now();
+        this.dashDecayStartTime = Date.now();
         
-        const dashDirection = new THREE.Vector3();
-        if (this.keys.forward) dashDirection.z += 1;
-        if (this.keys.backward) dashDirection.z -= 1;
-        if (this.keys.left) dashDirection.x -= 1;
-        if (this.keys.right) dashDirection.x += 1;
-        
-        if (dashDirection.lengthSq() === 0) {
-            // If no direction pressed, dash in facing direction
-            dashDirection.z = Math.cos(this.character.rotation.y);
-            dashDirection.x = Math.sin(this.character.rotation.y);
+        // Calculate dash direction based on input
+        const moveDir = new THREE.Vector3(0, 0, 0);
+        if (this.keys.forward) moveDir.z += 1;
+        if (this.keys.backward) moveDir.z -= 1;
+        if (this.keys.left) moveDir.x -= 1;
+        if (this.keys.right) moveDir.x += 1;
+
+        let dashDirection;
+        if (moveDir.lengthSq() > 0) {
+            moveDir.normalize();
+            
+            const cameraDirection = new THREE.Vector3();
+            this.camera.getWorldDirection(cameraDirection);
+            cameraDirection.y = 0;
+            cameraDirection.normalize();
+
+            const right = new THREE.Vector3();
+            right.crossVectors(new THREE.Vector3(0, 1, 0), cameraDirection);
+
+            // Create the dash direction relative to camera
+            dashDirection = new THREE.Vector3();
+            dashDirection.addScaledVector(cameraDirection, moveDir.z);
+            dashDirection.addScaledVector(right, -moveDir.x);
+            dashDirection.normalize();
+        } else {
+            // If no direction input, dash in facing direction
+            dashDirection = new THREE.Vector3(
+                Math.sin(this.character.rotation.y),
+                0,
+                Math.cos(this.character.rotation.y)
+            );
         }
-        
-        // Apply dash in the direction of camera
-        const cameraDirection = new THREE.Vector3();
-        this.camera.getWorldDirection(cameraDirection);
-        cameraDirection.y = 0;
-        cameraDirection.normalize();
 
-        const right = new THREE.Vector3();
-        right.crossVectors(new THREE.Vector3(0, 1, 0), cameraDirection);
+        // Calculate dash distance and apply it immediately
+        const dashDistance = 2.0; // Units to dash
+        const dashMovement = dashDirection.multiplyScalar(dashDistance);
+        this.character.position.add(dashMovement);
 
-        this.momentum.set(0, 0, 0);
-        this.momentum.addScaledVector(cameraDirection, dashDirection.z);
-        this.momentum.addScaledVector(right, dashDirection.x);
-        this.momentum.normalize();
-        this.momentum.multiplyScalar(this.dashForce);
+        // Set a smaller momentum in dash direction for follow-through
+        const baseSpeed = this.keys.shift ? this.maxRunSpeed : this.maxWalkSpeed;
+        const dashSpeed = baseSpeed * 1.5; // Reduced follow-through speed
+        this.momentum.copy(dashDirection).multiplyScalar(dashSpeed);
+
+        // Store the dash speed for decay
+        this.dashSpeedRetained = dashSpeed;
 
         // Add slight upward force to dash
-        this.velocity.y = this.isGrounded ? 0.1 : 0.2; // Higher upward force when air dashing
+        this.velocity.y = this.isGrounded ? 0.05 : 0.1;
 
         setTimeout(() => {
             this.isDashing = false;
-            this.momentum.multiplyScalar(0.7); // Preserve some momentum
             setTimeout(() => {
                 this.canDash = true;
-            }, 300); // Cooldown duration
-        }, 300); // Dash duration
+            }, 300);
+        }, 300);
     }
 
     // Add method to switch weapon position
